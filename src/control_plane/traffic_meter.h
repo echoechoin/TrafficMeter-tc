@@ -26,7 +26,7 @@ struct traffic_meter_ctl {
 
 	/* load / unload */
 	const char	*dev;		/* --dev <ifname> */
-	const char	*object;	/* --object <xdp.o> */
+	const char	*object;	/* --object <bpf.o> */
 	const char	*bpffs_pin;	/* --bpffs-pin <path> */
 
 	/* add / del / show */

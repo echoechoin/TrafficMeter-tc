@@ -1,5 +1,5 @@
 /*
- * traffic_meter -- BPF/XDP based traffic statistics tool
+ * traffic_meter -- BPF/TC based traffic statistics tool
  *
  * This file contains ONLY command-line parsing and subcommand dispatch.
  * Actual command implementations live in traffic_meter_cmd.c.
@@ -41,8 +41,8 @@ static void __attribute__((__noreturn__)) usage(void)
 		program_invocation_short_name);
 
 	fputs(USAGE_COMMANDS, out);
-	fputs(" load                    load XDP program and attach to NIC\n", out);
-	fputs(" unload                  detach XDP program from NIC\n", out);
+	fputs(" load                    load BPF program and attach to NIC\n", out);
+	fputs(" unload                  detach BPF program from NIC\n", out);
 	fputs(" add                     add an IP/CIDR rule\n", out);
 	fputs(" del                     delete an IP/CIDR rule\n", out);
 	fputs(" import                  import rules from a JSON file\n", out);
@@ -51,7 +51,7 @@ static void __attribute__((__noreturn__)) usage(void)
 
 	fputs(USAGE_OPTIONS, out);
 	fputs(" -d, --dev <ifname>      network interface (load/unload)\n", out);
-	fputs(" -o, --object <file>     XDP object file path (load)\n", out);
+	fputs(" -o, --object <file>     BPF object file path (load)\n", out);
 	fputs(" -p, --bpffs-pin <path>  bpffs pin path (load)\n", out);
 	fputs(" -a, --ip-address <addr> IP address or CIDR (add/del/show)\n", out);
 	fputs(" -f, --file <path>       JSON rules file (import)\n", out);
@@ -69,17 +69,17 @@ static void __attribute__((__noreturn__)) usage_cmd(const char *cmd)
 	fputs(USAGE_HEADER, out);
 
 	if (strcmp(cmd, "load") == 0) {
-		fprintf(out, " %s load --dev <ifname> [--object <xdp.o>] [--bpffs-pin <path>]\n",
+		fprintf(out, " %s load --dev <ifname> [--object <bpf.o>] [--bpffs-pin <path>]\n",
 			program_invocation_short_name);
 		fputs(USAGE_OPTIONS, out);
-		fputs(" -d, --dev <ifname>      network interface to attach XDP\n", out);
-		fputs(" -o, --object <file>     XDP object file (default: built-in path)\n", out);
+		fputs(" -d, --dev <ifname>      network interface to attach TC BPF\n", out);
+		fputs(" -o, --object <file>     BPF object file (default: built-in path)\n", out);
 		fputs(" -p, --bpffs-pin <path>  bpffs pin path for maps/program\n", out);
 	} else if (strcmp(cmd, "unload") == 0) {
 		fprintf(out, " %s unload --dev <ifname>\n",
 			program_invocation_short_name);
 		fputs(USAGE_OPTIONS, out);
-		fputs(" -d, --dev <ifname>      network interface to detach XDP\n", out);
+		fputs(" -d, --dev <ifname>      network interface to detach TC BPF\n", out);
 	} else if (strcmp(cmd, "add") == 0) {
 		fprintf(out, " %s add --ip-address <IP or CIDR>\n",
 			program_invocation_short_name);
