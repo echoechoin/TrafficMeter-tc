@@ -104,6 +104,13 @@ traffic_meter del --ip-address 192.168.1.100
 traffic_meter del --ip-address 10.0.0.0/24
 ```
 
+### Clear statistics
+
+```bash
+# Reset all per-rule counters to zero (rules are unchanged)
+traffic_meter clear
+```
+
 ### Unload BPF program
 
 ```bash

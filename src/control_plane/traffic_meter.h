@@ -16,6 +16,7 @@ enum {
 	CMD_IMPORT,
 	CMD_LIST,
 	CMD_SHOW,
+	CMD_CLEAR,
 };
 
 /*
@@ -49,5 +50,6 @@ int do_del(struct traffic_meter_ctl *ctl);
 int do_import(struct traffic_meter_ctl *ctl);
 int do_list(struct traffic_meter_ctl *ctl);
 int do_show(struct traffic_meter_ctl *ctl);
+int do_clear(struct traffic_meter_ctl *ctl);
 
 #endif /* TRAFFIC_METER_H */

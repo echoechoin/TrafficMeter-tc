@@ -954,3 +954,51 @@ int do_show(struct traffic_meter_ctl *ctl)
 
 	return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  clear                                                              */
+/* ------------------------------------------------------------------ */
+
+int do_clear(struct traffic_meter_ctl *ctl)
+{
+	const char *pin_path = ctl->bpffs_pin ? ctl->bpffs_pin : DEFAULT_PIN_PATH;
+	struct lpm_v4_key key_v4, next_v4;
+	struct lpm_v6_key key_v6, next_v6;
+	struct traffic_stats *zeros;
+	int fd_v4, fd_v6, ncpus;
+	int count = 0;
+	void *cur_v4 = NULL;
+	void *cur_v6 = NULL;
+
+	ncpus = libbpf_num_possible_cpus();
+	if (ncpus < 0)
+		errx(EXIT_FAILURE, "failed to get number of CPUs: %d", ncpus);
+
+	zeros = calloc((size_t)ncpus, sizeof(*zeros));
+	if (!zeros)
+		err(EXIT_FAILURE, "calloc");
+
+	fd_v4 = open_pinned_map(pin_path, "stats_v4");
+	fd_v6 = open_pinned_map(pin_path, "stats_v6");
+
+	while (bpf_map_get_next_key(fd_v4, cur_v4, &next_v4) == 0) {
+		key_v4 = next_v4;
+		cur_v4 = &key_v4;
+		if (bpf_map_update_elem(fd_v4, &key_v4, zeros, BPF_ANY) == 0)
+			count++;
+	}
+
+	while (bpf_map_get_next_key(fd_v6, cur_v6, &next_v6) == 0) {
+		key_v6 = next_v6;
+		cur_v6 = &key_v6;
+		if (bpf_map_update_elem(fd_v6, &key_v6, zeros, BPF_ANY) == 0)
+			count++;
+	}
+
+	close(fd_v4);
+	close(fd_v6);
+	free(zeros);
+
+	printf("cleared statistics for %d rule(s)\n", count);
+	return 0;
+}

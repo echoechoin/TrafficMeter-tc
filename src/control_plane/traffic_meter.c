@@ -25,6 +25,7 @@ static const char *cmd_names[] = {
 	[CMD_IMPORT] = "import",
 	[CMD_LIST]   = "list",
 	[CMD_SHOW]   = "show",
+	[CMD_CLEAR]  = "clear",
 };
 
 /* ------------------------------------------------------------------ */
@@ -48,6 +49,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(" import                  import rules from a JSON file\n", out);
 	fputs(" list                    list all current rules\n", out);
 	fputs(" show                    show traffic statistics\n", out);
+	fputs(" clear                   clear all traffic statistics (reset to zero)\n", out);
 
 	fputs(USAGE_OPTIONS, out);
 	fputs(" -d, --dev <ifname>      network interface (load/unload)\n", out);
@@ -104,6 +106,10 @@ static void __attribute__((__noreturn__)) usage_cmd(const char *cmd)
 		fputs(USAGE_OPTIONS, out);
 		fputs(" -a, --ip-address <addr> show statistics for specific rule only\n", out);
 		fputs(" -H, --human-readable    show bytes in human-readable format (KiB, MiB, GiB)\n", out);
+	} else if (strcmp(cmd, "clear") == 0) {
+		fprintf(out, " %s clear\n",
+			program_invocation_short_name);
+		fputs(" Clears all per-rule traffic statistics (resets counters to zero). Rules are unchanged.\n", out);
 	}
 
 	fputs(USAGE_SEPARATOR, out);
@@ -121,7 +127,7 @@ static int parse_command(const char *name)
 	if (!name)
 		return CMD_NONE;
 
-	for (size_t i = CMD_LOAD; i <= CMD_SHOW; i++) {
+	for (size_t i = CMD_LOAD; i <= CMD_CLEAR; i++) {
 		if (strcmp(name, cmd_names[i]) == 0)
 			return (int)i;
 	}
@@ -225,6 +231,8 @@ int main(int argc, char **argv)
 		return do_list(&ctl);
 	case CMD_SHOW:
 		return do_show(&ctl);
+	case CMD_CLEAR:
+		return do_clear(&ctl);
 	default:
 		warnx("no command specified");
 		errtryhelp(EXIT_FAILURE);
