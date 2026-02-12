@@ -65,13 +65,11 @@ traffic_meter import --file rules.json
 Example `rules.json`:
 
 ```json
-{
-  "rules": [
-    "192.168.1.0/24",
-    "10.0.0.0/8",
-    "2001:db8::/32"
-  ]
-}
+[
+  "192.168.1.0/24",
+  "10.0.0.0/8",
+  "2001:db8::/32"
+]
 ```
 
 ### List current rules
