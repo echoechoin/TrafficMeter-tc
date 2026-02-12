@@ -679,11 +679,15 @@ int do_list(struct traffic_meter_ctl *ctl)
 static void sum_percpu_stats(const struct traffic_stats *percpu, int ncpus,
 			     struct traffic_stats *out)
 {
-	out->packets = 0;
-	out->bytes   = 0;
+	out->rx_packets = 0;
+	out->rx_bytes   = 0;
+	out->tx_packets = 0;
+	out->tx_bytes   = 0;
 	for (int i = 0; i < ncpus; i++) {
-		out->packets += percpu[i].packets;
-		out->bytes   += percpu[i].bytes;
+		out->rx_packets += percpu[i].rx_packets;
+		out->rx_bytes   += percpu[i].rx_bytes;
+		out->tx_packets += percpu[i].tx_packets;
+		out->tx_bytes   += percpu[i].tx_bytes;
 	}
 }
 
@@ -711,16 +715,19 @@ static const char *fmt_bytes(__u64 bytes, char *buf, size_t len)
 }
 
 /*
- * Print one stats line.
+ * Print one stats line with rx/tx breakdown.
  */
 static void print_stats_line(const char *addr_str,
 			     const struct traffic_stats *agg)
 {
-	char bytes_buf[32];
-	printf("  %-40s  packets: %-12llu  bytes: %s\n",
+	char rx_buf[32], tx_buf[32];
+	printf("  %-40s\n"
+	       "      rx: %llu pkts, %s    tx: %llu pkts, %s\n",
 	       addr_str,
-	       (unsigned long long)agg->packets,
-	       fmt_bytes(agg->bytes, bytes_buf, sizeof(bytes_buf)));
+	       (unsigned long long)agg->rx_packets,
+	       fmt_bytes(agg->rx_bytes, rx_buf, sizeof(rx_buf)),
+	       (unsigned long long)agg->tx_packets,
+	       fmt_bytes(agg->tx_bytes, tx_buf, sizeof(tx_buf)));
 }
 
 /*

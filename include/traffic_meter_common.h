@@ -38,16 +38,71 @@ struct lpm_v6_key {
 };
 
 /* ------------------------------------------------------------------ */
+/*  Flow table keys and values                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * IPv4 flow key -- normalized so both directions of the same flow
+ * hash to the same entry.  ip_lo <= ip_hi; ports follow their IP.
+ *
+ * TCP/UDP: 5-tuple  (ip_lo, ip_hi, port_lo, port_hi, protocol)
+ * ICMP:    2-tuple  (ip_lo, ip_hi, 0, 0, IPPROTO_ICMP)
+ * Other:   2-tuple  (ip_lo, ip_hi, 0, 0, protocol)
+ */
+struct flow_key_v4 {
+	__u32	ip_lo;		/* min(src_ip, dst_ip) in network order */
+	__u32	ip_hi;		/* max(src_ip, dst_ip) in network order */
+	__u16	port_lo;	/* port associated with ip_lo */
+	__u16	port_hi;	/* port associated with ip_hi */
+	__u8	protocol;	/* L4 protocol number */
+	__u8	pad[3];
+};
+
+/*
+ * IPv6 flow key -- same normalization logic, larger addresses.
+ */
+struct flow_key_v6 {
+	__u8	ip_lo[16];
+	__u8	ip_hi[16];
+	__u16	port_lo;
+	__u16	port_hi;
+	__u8	protocol;
+	__u8	pad[3];
+};
+
+/*
+ * Flow info -- stored in the flow table (LRU hash map).
+ * Records the source IP of the first packet (the "original" direction).
+ */
+struct flow_info_v4 {
+	__u32	orig_src;	/* src IP of the first packet (net order) */
+};
+
+struct flow_info_v6 {
+	__u8	orig_src[16];	/* src IPv6 of the first packet */
+};
+
+/* ------------------------------------------------------------------ */
 /*  Statistics value (per-CPU)                                         */
 /* ------------------------------------------------------------------ */
 
 /*
- * Per-rule traffic counters.  In the kernel per-CPU map each CPU
- * has its own copy; userspace sums across all CPUs when querying.
+ * Per-rule traffic counters with direction.
+ *
+ * Direction is determined by the flow table:
+ *   - The first packet of a flow establishes the "original" direction.
+ *   - Subsequent packets are classified as "original" or "reply" by
+ *     comparing src IP against the stored orig_src.
+ *   - For matched rules: original direction → tx, reply direction → rx.
+ *
+ * In the kernel per-CPU map each CPU has its own copy; userspace sums
+ * across all CPUs when querying.
  */
 struct traffic_stats {
-	__u64	packets;
-	__u64	bytes;
+	__u64	rx_packets;
+	__u64	rx_bytes;
+	__u64	tx_packets;
+	__u64	tx_bytes;
 };
 
 /* ------------------------------------------------------------------ */
@@ -56,5 +111,7 @@ struct traffic_stats {
 
 #define MAX_RULES_V4	10240
 #define MAX_RULES_V6	10240
+#define MAX_FLOWS_V4	65536
+#define MAX_FLOWS_V6	65536
 
 #endif /* TRAFFIC_METER_COMMON_H */

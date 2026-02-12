@@ -10,7 +10,7 @@ traffic meter 是一个基于bpf xdp实现的流量统计模块。包含内核bp
 
 ### 1.1 目标场景
 
-- 按单 IP 或 IP 网段（CIDR）统计**本机所有网口**的流量（包数、字节数），统计结果为所有网口汇总，不按网口区分；**同时支持 IPv4 与 IPv6**。
+- 按单 IP 或 IP 网段（CIDR）统计**本机所有网口**的流量，**基于流表区分上下行（rx/tx）**：XDP 程序维护一张 LRU 流表，以流的**第一个报文方向**作为 original（tx/上行）方向，反向报文为 reply（rx/下行）方向。对于 `0.0.0.0/0` 等通配规则，rx/tx 分别反映各连接的入站和出站流量，语义正确。分别记录包数与字节数，统计结果为所有网口汇总，不按网口区分；**同时支持 IPv4 与 IPv6**。
 - 适用于流量审计、按 IP/网段限速或计费、异常流量排查等场景。
 
 ### 1.2 技术选型
@@ -18,6 +18,7 @@ traffic meter 是一个基于bpf xdp实现的流量统计模块。包含内核bp
 - **XDP（eXpress Data Path）**：在网卡驱动层或早于协议栈处处理报文，延迟低、吞吐高，适合做统计与过滤。
 - **内核态统计**：统计在 BPF 程序内完成，避免把报文拷贝到用户态，减少 CPU 与内存开销。
 - **BPF Map**：规则与统计结果存放在内核 Map 中，用户态通过 libbpf 读写，实现配置下发与查询。
+- **自建 BPF 流表**：使用 `BPF_MAP_TYPE_LRU_HASH` 在 XDP 层维护流表，通过首包方向判定上下行，无需依赖内核 conntrack 或切换到 TC BPF，保持 XDP 高性能。
 
 ---
 
@@ -34,6 +35,7 @@ flowchart LR
   end
   subgraph kernel [内核态]
     XDP[XDP_BPF_程序]
+    FlowTable[流表_LRU_Map]
     RulesMap[规则_Map]
     StatsMap[统计_Map]
   end
@@ -43,15 +45,16 @@ flowchart LR
   end
   D0 -->|报文| XDP
   D1 -->|报文| XDP
-  XDP --> RulesMap
-  XDP --> StatsMap
+  XDP -->|查方向| FlowTable
+  XDP -->|匹配规则| RulesMap
+  XDP -->|按方向计数| StatsMap
   CLI -->|下发规则_查询统计| RulesMap
   CLI -->|查询统计| StatsMap
 ```
 
 ### 2.2 数据流
 
-- **报文路径**：任意网口收包 → 该网口驱动触发 XDP → BPF 解析 IP 头、提取源/目的 IP → 在**同一套**规则 Map 中做 LPM 查找 → 若匹配则从 LPM value 读取规则前缀长度，将主机 IP 掩码回网络地址重建规则 key → 用规则 key 在**同一套**统计 Map 中 lookup 并递增 packets/bytes → 返回 XDP_PASS 继续协议栈处理。因此各网口的报文都会更新同一组统计，得到**所有网口汇总**的流量。
+- **报文路径**：任意网口收包 → 该网口驱动触发 XDP → BPF 解析 IP 头、提取源/目的 IP 与 L4 端口 → **构造归一化 flow key 并查询流表（LRU Map）**：首包则插入条目记录 orig_src，后续包与 orig_src 比较判定 original/reply 方向 → 在**同一套**规则 Map 中对源/目的 IP 分别做 LPM 查找 → 若匹配则从 LPM value 读取规则前缀长度，重建规则 key → 按流方向在统计 Map 中递增：**original → tx**、**reply → rx** → 返回 XDP_PASS。各网口报文更新同一组统计，得到**所有网口汇总**的流量，按流方向区分上下行。
 - **管理路径**：用户态管理程序通过 libbpf 加载 BPF 目标文件得到一套 Map，向规则 Map 写入或删除条目（添加/删除需统计的 IP 或网段），**同时在统计 Map 中预创建/删除对应的零值条目**；从规则 Map 与统计 Map 读取当前规则列表及流量统计（即全机汇总结果）。
 
 ---
@@ -66,7 +69,8 @@ flowchart LR
 ### 3.2 报文解析
 
 - 在 XDP 中解析以太网头，根据 `eth_proto` 识别 **IPv4（`ETH_P_IP`）或 IPv6（`ETH_P_IPV6`）**；支持 **单层 VLAN（802.1Q / 802.1AD）** 标签跳过；校验报文长度足够（eth + IP 头），解析对应 IP 头获取 **源 IP、目的 IP**（IPv4 为 4 字节，IPv6 为 16 字节）；不修改报文，仅读取。
-- IPv4 与 IPv6 报文分别进入对应的规则匹配与统计分支（见 3.3、5.1）。
+- **L4 端口提取**：对 TCP 和 UDP 报文进一步解析 L4 头获取源/目的端口，用于构造流表 key（五元组）；ICMP 及其他协议端口置零（流表仅用 IP 二元组 + 协议号区分流）。
+- IPv4 与 IPv6 报文分别进入对应的流方向判定、规则匹配与统计分支（见 3.3、3.4、3.5）。
 
 ### 3.3 规则与匹配
 
@@ -75,18 +79,35 @@ flowchart LR
 - **匹配逻辑**：
   - 单 IP 视为 prefixlen=32（IPv4）或 128（IPv6）的 CIDR，统一使用 LPM 查找。
   - 网段（CIDR）：key 为 `prefixlen + addr`（IPv4：prefixlen 0–32，addr 4 字节；IPv6：prefixlen 0–128，addr 16 字节）；匹配时根据报文协议类型在对应规则表中对 **源 IP 和目的 IP 分别** 做 LPM 查找，取最长匹配（若存在）作为该报文所属规则。
-- 一条报文的源 IP 和目的 IP **分别独立匹配**：若源 IP 匹配规则 A、目的 IP 匹配规则 B，则 A 和 B 的统计各自累加。
+- 一条报文的源 IP 和目的 IP **分别独立匹配**：若源 IP 匹配规则 A、目的 IP 匹配规则 B，则 A 和 B 的统计各自按**同一流方向**（original → tx / reply → rx）累加。
 
-### 3.4 统计
+### 3.4 流表与方向判定
+
+- **自建 BPF 流表**：XDP 程序维护一张 `BPF_MAP_TYPE_LRU_HASH` 类型的流表（IPv4 与 IPv6 各一张），用于跟踪连接并判定报文的上下行方向。
+- **Flow Key 归一化**：为使同一条流的正反方向映射到同一个 key，对 IP 地址做排序归一化（`ip_lo <= ip_hi`），端口跟随各自的 IP：
+  - **TCP / UDP**：五元组 `(ip_lo, ip_hi, port_lo, port_hi, protocol)`
+  - **ICMP 及其他协议**：二元组 + 协议号 `(ip_lo, ip_hi, 0, 0, protocol)`
+- **方向判定逻辑**：
+  1. 构造归一化 flow key，查询流表。
+  2. **未命中（首包）**：以 `BPF_NOEXIST` 标志插入条目，记录 `orig_src`（首包源 IP）。该报文方向为 **original**。
+  3. **已命中**：比较当前报文源 IP 与 `orig_src`，相同 → **original**，不同 → **reply**。
+  4. **多 CPU 竞争**：`BPF_NOEXIST` 插入失败（`-EEXIST`）说明其他 CPU 先插入，再做一次 lookup 获取 winner 的记录来判断方向。
+- **LRU 自动淘汰**：流表满时自动淘汰最久未访问的条目，无需手动清理或 timer。
+
+### 3.5 统计
 
 - **按规则 key 维护**：统计 Map 的 key 与规则 Map 的 key **完全一致**（即规则的 `prefixlen + network_addr`），每条规则在统计 Map 中有且仅有一条对应的统计条目。
-- **统计条目由用户态预创建**：用户态执行 `add` 命令时，在写入规则 Map 的同时，在统计 Map 中预创建一条零值 `{packets=0, bytes=0}` 的条目（`BPF_NOEXIST`，不覆盖已有值）。这样 `stats` 命令即使在无流量时也能显示该规则。`del` 命令删除规则时同步删除对应的统计条目。
-- **XDP 更新逻辑**：XDP 匹配到规则后，从 LPM value 读取 `matched_prefixlen`，将报文的主机 IP 按该前缀长度掩码（`build_rule_key_v4/v6`：使用编译期常量索引遍历每个字节，保留前缀位、清零主机位，避免 BPF 验证器拒绝的变量偏移栈访问），得到规则级别的 key，再在统计 Map 中 lookup 并原地递增 `packets` 和 `bytes`。由于统计条目已被用户态预创建，XDP 仅做 lookup + update，不做 insert。
-- **Map 类型**：使用 **per-CPU 类型**（`BPF_MAP_TYPE_PERCPU_HASH`），每 CPU 独立计数，无写竞争；用户态查询时对各 CPU 的 value 求和得到总包数/总字节数。
+- **上下行分计**：每条统计条目记录 **rx（接收/下行）** 与 **tx（发送/上行）** 两组独立计数器，方向由流表判定：
+  - `tx_packets` / `tx_bytes`：报文处于 **original** 方向（与首包同向）时累加。
+  - `rx_packets` / `rx_bytes`：报文处于 **reply** 方向（与首包反向）时累加。
+  - 对于 `0.0.0.0/0` 规则：每条连接的首包方向记为 tx，应答方向记为 rx，rx/tx 分别反映各连接的入站和出站流量。
+- **统计条目由用户态预创建**：用户态执行 `add` 命令时，在写入规则 Map 的同时，在统计 Map 中预创建一条零值 `{rx_packets=0, rx_bytes=0, tx_packets=0, tx_bytes=0}` 的条目（`BPF_NOEXIST`，不覆盖已有值）。这样 `stats` 命令即使在无流量时也能显示该规则。`del` 命令删除规则时同步删除对应的统计条目。
+- **XDP 更新逻辑**：XDP 先通过流表得到方向，再匹配规则后，从 LPM value 读取 `matched_prefixlen`，将报文的主机 IP 按该前缀长度掩码（`build_rule_key_v4/v6`：使用编译期常量索引遍历每个字节，保留前缀位、清零主机位，避免 BPF 验证器拒绝的变量偏移栈访问），得到规则级别的 key，再在统计 Map 中 lookup 并按流方向原地递增（original → tx，reply → rx）。由于统计条目已被用户态预创建，XDP 仅做 lookup + update，不做 insert。
+- **Map 类型**：使用 **per-CPU 类型**（`BPF_MAP_TYPE_PERCPU_HASH`），每 CPU 独立计数，无写竞争；用户态查询时对各 CPU 的 value 求和得到总 rx/tx 包数与字节数。
 
-### 3.5 与用户态交互
+### 3.6 与用户态交互
 
-- 通过 **BPF Map** 暴露规则表与统计表；无需额外 netlink 或字符设备。
+- 通过 **BPF Map** 暴露规则表与统计表；流表为 XDP 内部使用，用户态不直接操作。无需额外 netlink 或字符设备。
 - 程序与 Map 可由用户态通过 **pin 到 bpffs**（如 `/sys/fs/bpf/traffic_meter/`）实现持久化与多进程访问；或进程内 fd 传递（单进程管理、不 pin）。
 
 ---
@@ -115,7 +136,7 @@ flowchart LR
 | 子命令 | 必选参数 | 可选参数 | 说明 |
 |--------|----------|----------|------|
 | `list` | — | — | 列出当前已下发的所有 IP/网段规则。 |
-| `stats` | — | `--ip-address <IP 或 CIDR>` | 查询流量统计；不指定则输出全部规则的统计，指定则对该规则 key 做精确查找（支持 IPv4 与 IPv6）。字节数以人类可读格式（B/KiB/MiB/GiB/TiB）展示。 |
+| `stats` | — | `--ip-address <IP 或 CIDR>` | 查询流量统计；不指定则输出全部规则的统计，指定则对该规则 key 做精确查找（支持 IPv4 与 IPv6）。每条规则分别显示 **rx**（reply 方向，下行）和 **tx**（original 方向，上行）的包数与字节数，字节数以人类可读格式（B/KiB/MiB/GiB/TiB）展示。 |
 
 **JSON 文件格式约定**：根节点为数组，每项为一个 IP 或 CIDR 字符串；支持 **IPv4** 与 **IPv6** 地址或 CIDR。示例：
 
@@ -132,7 +153,7 @@ flowchart LR
 ### 4.2 职责
 
 - **下发需统计的 IP/网段**：向内核 BPF 的规则 Map 添加或删除条目（单 IP 或 CIDR），同时同步维护统计 Map 中的对应条目。
-- **查询**：从内核读取已下发的 IP、网段列表，以及各规则对应的流量统计（包数、字节数）。
+- **查询**：从内核读取已下发的 IP、网段列表，以及各规则对应的流量统计（rx/tx 包数与字节数）。
 
 ### 4.3 与内核交互
 
@@ -145,7 +166,7 @@ flowchart LR
 - **删除规则**：根据 IP 或 CIDR 标识删除规则 Map 条目，**同时删除统计 Map 中对应的条目**。
 - **批量导入**：使用 json-c 解析 JSON 文件，逐条添加规则和统计条目，跳过无效条目并输出警告。
 - **列表规则**：遍历规则 Map（`rules_v4` + `rules_v6`），输出当前已下发的所有 IP/网段。
-- **查询统计**：遍历统计 Map（`stats_v4` + `stats_v6`）或按指定规则 key 精确查找；对 per-CPU Map 的各 CPU value 求和后展示 packets 和 bytes（人类可读格式）。
+- **查询统计**：遍历统计 Map（`stats_v4` + `stats_v6`）或按指定规则 key 精确查找；对 per-CPU Map 的各 CPU value 分别求和 rx（reply 方向）和 tx（original 方向）后展示 rx_packets/rx_bytes 与 tx_packets/tx_bytes（字节以人类可读格式）。
 
 ### 4.5 接口形式
 
@@ -171,15 +192,22 @@ flowchart LR
 | `rules_v6` | `BPF_MAP_TYPE_LPM_TRIE` | `struct lpm_v6_key` | `__u32`（prefixlen） | 存储 IPv6 规则 |
 | `stats_v4` | `BPF_MAP_TYPE_PERCPU_HASH` | `struct lpm_v4_key` | `struct traffic_stats` | IPv4 per-CPU 统计；key 与规则 key 一致（prefixlen + 网络地址） |
 | `stats_v6` | `BPF_MAP_TYPE_PERCPU_HASH` | `struct lpm_v6_key` | `struct traffic_stats` | IPv6 per-CPU 统计 |
+| `flow_table_v4` | `BPF_MAP_TYPE_LRU_HASH` | `struct flow_key_v4` | `struct flow_info_v4` | IPv4 流表；归一化五元组/二元组为 key，记录首包 src IP |
+| `flow_table_v6` | `BPF_MAP_TYPE_LRU_HASH` | `struct flow_key_v6` | `struct flow_info_v6` | IPv6 流表 |
 
-- **全机一套 Map、多口共享**：全机仅创建**一套**规则 Map（IPv4 + IPv6）与统计 Map；首次 `load` 创建并 pin 到 bpffs，后续 `load` 自动复用已 pin 的 Map。所有已挂载网口共享同一套 Map，统计结果为所有网口汇总。
+- **全机一套 Map、多口共享**：全机仅创建**一套**规则 Map（IPv4 + IPv6）、统计 Map 与流表 Map；首次 `load` 创建并 pin 到 bpffs，后续 `load` 自动复用已 pin 的 Map。所有已挂载网口共享同一套 Map，统计结果为所有网口汇总。
 - **规则 Map**：IPv4 与 IPv6 各一个 LPM Map，key 为 CIDR（prefixlen + addr），value 为 `__u32` 前缀长度。XDP 查找后读取 value 来重建规则级别的 stats key。
-- **统计 Map**：per-CPU hash，key 与规则 Map 的 key **完全一致**（prefixlen + 网络地址），value 为 `struct traffic_stats { __u64 packets; __u64 bytes; }`。条目由用户态 `add` 命令预创建（零值），XDP 仅做 lookup + 原地更新。
+- **流表 Map**：IPv4 与 IPv6 各一个 LRU hash Map。Key 为归一化的流标识（TCP/UDP 五元组，ICMP 及其他协议用 IP 二元组 + 协议号）；Value 记录首包的源 IP（`orig_src`），用于后续报文的方向判定。LRU 自动淘汰最久未使用的条目，默认容量 65536。
+- **统计 Map**：per-CPU hash，key 与规则 Map 的 key **完全一致**（prefixlen + 网络地址），value 为 `struct traffic_stats { __u64 rx_packets; __u64 rx_bytes; __u64 tx_packets; __u64 tx_bytes; }`，按流方向分计（original → tx，reply → rx）。条目由用户态 `add` 命令预创建（零值），XDP 仅做 lookup + 按方向原地更新。
 
 ### 5.3 用户态与内核共享结构
 
 - 规则条目：与内核 LPM key 一致；IPv4 为 `struct lpm_v4_key { __u32 prefixlen; __u8 addr[4]; }`，IPv6 为 `struct lpm_v6_key { __u32 prefixlen; __u8 addr[16]; }`；用户态根据 `--ip-address` 解析为 v4 或 v6 后构造对应布局再 `bpf_map_update_elem`。
-- 统计条目：`struct traffic_stats { __u64 packets; __u64 bytes; }`，各 CPU 一份（per-CPU map）；用户态通过 `libbpf_num_possible_cpus()` 获取 CPU 数，分配 `ncpus * sizeof(struct traffic_stats)` 的缓冲区读取所有 CPU 后求和。需保证结构体对齐与 ABI 一致（无 padding 歧义）。
+- 统计条目：`struct traffic_stats { __u64 rx_packets; __u64 rx_bytes; __u64 tx_packets; __u64 tx_bytes; }`，各 CPU 一份（per-CPU map）；用户态通过 `libbpf_num_possible_cpus()` 获取 CPU 数，分配 `ncpus * sizeof(struct traffic_stats)` 的缓冲区读取所有 CPU 后分别对 rx/tx 求和。需保证结构体对齐与 ABI 一致（无 padding 歧义）。
+- 流表结构（XDP 内部使用，用户态不直接操作）：
+  - IPv4 flow key：`struct flow_key_v4 { __u32 ip_lo, ip_hi; __u16 port_lo, port_hi; __u8 protocol; __u8 pad[3]; }`
+  - IPv6 flow key：`struct flow_key_v6 { __u8 ip_lo[16], ip_hi[16]; __u16 port_lo, port_hi; __u8 protocol; __u8 pad[3]; }`
+  - Flow info：`struct flow_info_v4 { __u32 orig_src; }` / `struct flow_info_v6 { __u8 orig_src[16]; }`
 
 ---
 
@@ -223,4 +251,6 @@ flowchart LR
 ### 7.3 可选与后续扩展
 
 - **多网口与统计维度**：当前设计为**所有口汇总统计**，一套 Map 共享到所有已挂载网口；若后续需**按网口分别查看**某 IP/网段的流量，可扩展为按网口分 Map 或在统计 key 中带 ifindex。
+- **流表容量调优**：默认 `MAX_FLOWS_V4 = MAX_FLOWS_V6 = 65536`，高并发流场景可增大；LRU 自动淘汰保证不会 OOM，但过小会导致短连接频繁淘汰后重入被当作新首包。
+- **IPv6 扩展头**：当前 IPv6 L4 端口提取仅处理固定头后紧跟的 nexthdr；若需跳过扩展头链，可后续增加扩展头遍历逻辑。
 - **持久化**：规则与统计的持久化可通过用户态配置 + Map pin 或定期 dump 到文件实现，不在本期设计书强制要求。
