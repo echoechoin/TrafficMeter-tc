@@ -15,7 +15,7 @@ enum {
 	CMD_DEL,
 	CMD_IMPORT,
 	CMD_LIST,
-	CMD_STATS,
+	CMD_SHOW,
 };
 
 /*
@@ -29,7 +29,7 @@ struct traffic_meter_ctl {
 	const char	*object;	/* --object <xdp.o> */
 	const char	*bpffs_pin;	/* --bpffs-pin <path> */
 
-	/* add / del / stats */
+	/* add / del / show */
 	const char	*ip_address;	/* --ip-address <IP or CIDR> */
 
 	/* import */
@@ -45,6 +45,6 @@ int do_add(struct traffic_meter_ctl *ctl);
 int do_del(struct traffic_meter_ctl *ctl);
 int do_import(struct traffic_meter_ctl *ctl);
 int do_list(struct traffic_meter_ctl *ctl);
-int do_stats(struct traffic_meter_ctl *ctl);
+int do_show(struct traffic_meter_ctl *ctl);
 
 #endif /* TRAFFIC_METER_H */

@@ -54,8 +54,6 @@
 		, " -h, --help",    "display this help" \
 		, " -V, --version", "display version"
 
-#define USAGE_MAN_TAIL(_man)	"\nFor more details see %s.\n", _man
-
 #define PROGRAM_VERSION		"0.1.0"
 
 static inline void __attribute__((__noreturn__))

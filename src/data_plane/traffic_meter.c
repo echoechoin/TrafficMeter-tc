@@ -1,19 +1,22 @@
 /*
- * traffic_meter -- XDP data plane
+ * traffic_meter -- TC BPF data plane (ingress + egress)
  *
- * For each incoming packet:
+ * Attached to both the ingress and egress paths of a network interface
+ * via the clsact qdisc, so it sees packets in both directions.
+ *
+ * For each packet:
  *   1. Parse IP header, extract src/dst IP and L4 ports.
  *   2. Query the flow table (flow_table.h) to determine whether this
  *      packet is in the "original" or "reply" direction of its flow.
  *   3. Look up src and dst IP in the LPM rules map.  For each matched
- *      rule, reconstruct the rule-level stats key and update the
- *      per-CPU statistics:
- *        original direction → tx (traffic FROM this address/prefix)
- *        reply    direction → rx (traffic TO   this address/prefix)
- *   4. Return XDP_PASS so the packet continues to the normal stack.
+ *      rule, update per-CPU byte statistics:
+ *        original direction → tx_bytes
+ *        reply    direction → rx_bytes
+ *   4. Return TC_ACT_OK so the packet continues normally.
  */
 
 #include <linux/bpf.h>
+#include <linux/pkt_cls.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
@@ -33,12 +36,6 @@
 /*  BPF Maps -- rules & statistics                                     */
 /* ------------------------------------------------------------------ */
 
-/*
- * IPv4 rule map -- LPM trie.
- * Key:   struct lpm_v4_key { prefixlen, addr[4] }
- * Value: __u32 -- the rule's prefix length (so XDP can reconstruct
- *        the rule key for the stats map after an LPM lookup).
- */
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_v4_key);
@@ -47,9 +44,6 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } rules_v4 SEC(".maps");
 
-/*
- * IPv6 rule map -- LPM trie.
- */
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_v6_key);
@@ -58,11 +52,6 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } rules_v6 SEC(".maps");
 
-/*
- * IPv4 per-CPU statistics map.
- * Key:   struct lpm_v4_key (rule key: prefixlen + network addr)
- * Value: struct traffic_stats { rx_packets, rx_bytes, tx_packets, tx_bytes }
- */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __type(key, struct lpm_v4_key);
@@ -70,9 +59,6 @@ struct {
     __uint(max_entries, MAX_RULES_V4);
 } stats_v4 SEC(".maps");
 
-/*
- * IPv6 per-CPU statistics map.
- */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __type(key, struct lpm_v6_key);
@@ -84,11 +70,6 @@ struct {
 /*  Helpers: rule key reconstruction                                   */
 /* ------------------------------------------------------------------ */
 
-/*
- * Build the rule-level stats key from a host address and the matched
- * rule's prefix length.  Uses constant indices only (pragma unroll)
- * to satisfy the BPF verifier.
- */
 static __always_inline void
 build_rule_key_v4(struct lpm_v4_key *rule_key,
                   const __u8 *host_addr, __u32 prefix)
@@ -126,7 +107,7 @@ build_rule_key_v6(struct lpm_v6_key *rule_key,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Helpers: per-rule accounting with direction                        */
+/*  Helpers: per-rule accounting with direction (bytes only)            */
 /* ------------------------------------------------------------------ */
 
 static __always_inline void
@@ -136,13 +117,10 @@ account_v4(struct lpm_v4_key *rule_key, __u64 pkt_len, int direction)
     if (!st)
         return;
 
-    if (direction == DIR_ORIGINAL) {
-        st->tx_packets += 1;
-        st->tx_bytes   += pkt_len;
-    } else {
-        st->rx_packets += 1;
-        st->rx_bytes   += pkt_len;
-    }
+    if (direction == DIR_ORIGINAL)
+        st->tx_bytes += pkt_len;
+    else
+        st->rx_bytes += pkt_len;
 }
 
 static __always_inline void
@@ -152,27 +130,16 @@ account_v6(struct lpm_v6_key *rule_key, __u64 pkt_len, int direction)
     if (!st)
         return;
 
-    if (direction == DIR_ORIGINAL) {
-        st->tx_packets += 1;
-        st->tx_bytes   += pkt_len;
-    } else {
-        st->rx_packets += 1;
-        st->rx_bytes   += pkt_len;
-    }
+    if (direction == DIR_ORIGINAL)
+        st->tx_bytes += pkt_len;
+    else
+        st->rx_bytes += pkt_len;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Helpers: extract L4 ports for flow key construction                */
 /* ------------------------------------------------------------------ */
 
-/*
- * Extract L4 identifiers for flow key construction.
- *
- *   TCP / UDP : source and destination ports (5-tuple flow key).
- *   ICMP echo : ICMP ID field (shared between request and reply)
- *               placed into sport; dport stays 0.
- *   Other     : ports stay 0 (flow keyed by IP 2-tuple + protocol).
- */
 static __always_inline void
 extract_ports_v4(void *data, void *data_end,
                  struct iphdr *iph,
@@ -208,7 +175,6 @@ extract_ports_v4(void *data, void *data_end,
             __u8 type = ih->type;
             if (type == ICMP_ECHO || type == ICMP_ECHOREPLY)
                 *sport = ih->un.echo.id;
-            /* non-echo ICMP: ports stay 0 */
         }
         break;
     }
@@ -252,7 +218,6 @@ extract_ports_v6(void *data, void *data_end,
             if (type == ICMPV6_ECHO_REQUEST ||
                 type == ICMPV6_ECHO_REPLY)
                 *sport = ih6->icmp6_dataun.u_echo.identifier;
-            /* non-echo ICMPv6: ports stay 0 */
         }
         break;
     }
@@ -265,16 +230,6 @@ extract_ports_v6(void *data, void *data_end,
 /*  Helpers: TCP SYN detection                                         */
 /* ------------------------------------------------------------------ */
 
-/*
- * Check whether a TCP packet carries the SYN flag (SYN or SYN-ACK).
- * These indicate a new or restarted connection and should trigger a
- * flow table overwrite so orig_src tracks the current initiator.
- *
- * @l4:       pointer to the start of the TCP header
- * @data_end: packet boundary for bounds checking
- *
- * Returns 1 if SYN is set, 0 otherwise (including non-parseable).
- */
 static __always_inline int
 is_tcp_syn(void *l4, void *data_end)
 {
@@ -293,14 +248,12 @@ process_ipv4(void *data, void *data_end, __u64 pkt_len)
 {
     struct iphdr *iph = data + sizeof(struct ethhdr);
 
-    /* bounds check: ethernet + minimum IPv4 header */
     if ((void *)(iph + 1) > data_end)
-        return XDP_PASS;
+        return TC_ACT_OK;
 
     __u32 src_ip = iph->saddr;
     __u32 dst_ip = iph->daddr;
 
-    /* Extract L4 ports (TCP/UDP) or ICMP ID */
     __u16 sport, dport;
     extract_ports_v4(data, data_end, iph, &sport, &dport);
 
@@ -309,12 +262,10 @@ process_ipv4(void *data, void *data_end, __u64 pkt_len)
     if (iph->protocol == IPPROTO_TCP)
         force_new = is_tcp_syn((void *)iph + (__u32)iph->ihl * 4, data_end);
 
-    /* Determine flow direction via flow table */
     int direction = flow_lookup_v4(src_ip, dst_ip,
                                    sport, dport, iph->protocol,
                                    force_new);
 
-    /* Build LPM lookup key with prefixlen=32 (exact host) */
     struct lpm_v4_key lookup = { .prefixlen = 32 };
     struct lpm_v4_key rule_key;
     __u32 *matched_prefix;
@@ -335,7 +286,7 @@ process_ipv4(void *data, void *data_end, __u64 pkt_len)
         account_v4(&rule_key, pkt_len, direction);
     }
 
-    return XDP_PASS;
+    return TC_ACT_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -347,20 +298,16 @@ process_ipv6(void *data, void *data_end, __u64 pkt_len)
 {
     struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
 
-    /* bounds check: ethernet + IPv6 header */
     if ((void *)(ip6h + 1) > data_end)
-        return XDP_PASS;
+        return TC_ACT_OK;
 
-    /* Extract L4 ports */
     __u16 sport, dport;
     extract_ports_v6(data, data_end, ip6h, &sport, &dport);
 
-    /* TCP SYN / SYN-ACK → force flow table overwrite */
     int force_new = 0;
     if (ip6h->nexthdr == IPPROTO_TCP)
         force_new = is_tcp_syn((void *)(ip6h + 1), data_end);
 
-    /* Determine flow direction via flow table */
     int direction = flow_lookup_v6((__u8 *)&ip6h->saddr,
                                    (__u8 *)&ip6h->daddr,
                                    sport, dport, ip6h->nexthdr,
@@ -370,7 +317,6 @@ process_ipv6(void *data, void *data_end, __u64 pkt_len)
     struct lpm_v6_key rule_key;
     __u32 *matched_prefix;
 
-    /* Source IP lookup */
     __builtin_memcpy(lookup.addr, &ip6h->saddr, 16);
     matched_prefix = bpf_map_lookup_elem(&rules_v6, &lookup);
     if (matched_prefix) {
@@ -378,7 +324,6 @@ process_ipv6(void *data, void *data_end, __u64 pkt_len)
         account_v6(&rule_key, pkt_len, direction);
     }
 
-    /* Destination IP lookup */
     __builtin_memcpy(lookup.addr, &ip6h->daddr, 16);
     matched_prefix = bpf_map_lookup_elem(&rules_v6, &lookup);
     if (matched_prefix) {
@@ -386,24 +331,23 @@ process_ipv6(void *data, void *data_end, __u64 pkt_len)
         account_v6(&rule_key, pkt_len, direction);
     }
 
-    return XDP_PASS;
+    return TC_ACT_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/*  XDP entry point                                                    */
+/*  Shared packet processing logic                                     */
 /* ------------------------------------------------------------------ */
 
-SEC("xdp")
-int traffic_meter_xdp(struct xdp_md *ctx)
+static __always_inline int
+traffic_meter_process(struct __sk_buff *skb)
 {
-    void *data     = (void *)(unsigned long)ctx->data;
-    void *data_end = (void *)(unsigned long)ctx->data_end;
-    __u64 pkt_len  = (__u64)(data_end - data);
+    void *data     = (void *)(unsigned long)skb->data;
+    void *data_end = (void *)(unsigned long)skb->data_end;
+    __u64 pkt_len  = (__u64)skb->len;
 
-    /* Need at least an Ethernet header */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_PASS;
+        return TC_ACT_OK;
 
     __u16 eth_proto = bpf_ntohs(eth->h_proto);
 
@@ -415,7 +359,7 @@ int traffic_meter_xdp(struct xdp_md *ctx)
         } *vhdr = (void *)(eth + 1);
 
         if ((void *)(vhdr + 1) > data_end)
-            return XDP_PASS;
+            return TC_ACT_OK;
 
         eth_proto = bpf_ntohs(vhdr->h_vlan_encapsulated_proto);
     }
@@ -426,8 +370,34 @@ int traffic_meter_xdp(struct xdp_md *ctx)
     case ETH_P_IPV6:
         return process_ipv6(data, data_end, pkt_len);
     default:
-        return XDP_PASS;
+        return TC_ACT_OK;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  TC BPF entry points                                                */
+/* ------------------------------------------------------------------ */
+
+SEC("tc")
+int traffic_meter_ingress(struct __sk_buff *skb)
+{
+    return traffic_meter_process(skb);
+}
+
+SEC("tc")
+int traffic_meter_egress(struct __sk_buff *skb)
+{
+    /*
+     * Skip bridge-forwarded packets to avoid double counting.
+     * If ingress_ifindex is set and differs from the current ifindex,
+     * this packet entered from another interface and is being forwarded
+     * through a bridge -- it was already counted on the ingress side.
+     */
+    if (skb->ingress_ifindex != 0 &&
+        skb->ingress_ifindex != skb->ifindex)
+        return TC_ACT_OK;
+
+    return traffic_meter_process(skb);
 }
 
 char _license[] SEC("license") = "GPL";

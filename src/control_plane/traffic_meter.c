@@ -24,7 +24,7 @@ static const char *cmd_names[] = {
 	[CMD_DEL]    = "del",
 	[CMD_IMPORT] = "import",
 	[CMD_LIST]   = "list",
-	[CMD_STATS]  = "stats",
+	[CMD_SHOW]   = "show",
 };
 
 /* ------------------------------------------------------------------ */
@@ -47,19 +47,17 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(" del                     delete an IP/CIDR rule\n", out);
 	fputs(" import                  import rules from a JSON file\n", out);
 	fputs(" list                    list all current rules\n", out);
-	fputs(" stats                   show traffic statistics\n", out);
+	fputs(" show                    show traffic statistics\n", out);
 
 	fputs(USAGE_OPTIONS, out);
 	fputs(" -d, --dev <ifname>      network interface (load/unload)\n", out);
 	fputs(" -o, --object <file>     XDP object file path (load)\n", out);
 	fputs(" -p, --bpffs-pin <path>  bpffs pin path (load)\n", out);
-	fputs(" -a, --ip-address <addr> IP address or CIDR (add/del/stats)\n", out);
+	fputs(" -a, --ip-address <addr> IP address or CIDR (add/del/show)\n", out);
 	fputs(" -f, --file <path>       JSON rules file (import)\n", out);
 
 	fputs(USAGE_SEPARATOR, out);
 	fprintf(out, USAGE_HELP_OPTIONS(28));
-
-	fprintf(out, USAGE_MAN_TAIL("traffic_meter(8)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -100,11 +98,11 @@ static void __attribute__((__noreturn__)) usage_cmd(const char *cmd)
 	} else if (strcmp(cmd, "list") == 0) {
 		fprintf(out, " %s list\n",
 			program_invocation_short_name);
-	} else if (strcmp(cmd, "stats") == 0) {
-		fprintf(out, " %s stats [--ip-address <IP or CIDR>]\n",
+	} else if (strcmp(cmd, "show") == 0) {
+		fprintf(out, " %s show [--ip-address <IP or CIDR>]\n",
 			program_invocation_short_name);
 		fputs(USAGE_OPTIONS, out);
-		fputs(" -a, --ip-address <addr> show stats for specific rule only\n", out);
+		fputs(" -a, --ip-address <addr> show statistics for specific rule only\n", out);
 	}
 
 	fputs(USAGE_SEPARATOR, out);
@@ -122,7 +120,7 @@ static int parse_command(const char *name)
 	if (!name)
 		return CMD_NONE;
 
-	for (size_t i = CMD_LOAD; i <= CMD_STATS; i++) {
+	for (size_t i = CMD_LOAD; i <= CMD_SHOW; i++) {
 		if (strcmp(name, cmd_names[i]) == 0)
 			return (int)i;
 	}
@@ -220,8 +218,8 @@ int main(int argc, char **argv)
 		return do_import(&ctl);
 	case CMD_LIST:
 		return do_list(&ctl);
-	case CMD_STATS:
-		return do_stats(&ctl);
+	case CMD_SHOW:
+		return do_show(&ctl);
 	default:
 		warnx("no command specified");
 		errtryhelp(EXIT_FAILURE);

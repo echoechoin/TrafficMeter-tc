@@ -173,14 +173,44 @@ static int maps_already_pinned(const char *pin_path)
 	return access(path, F_OK) == 0;
 }
 
+/* (programs are looked up by name via bpf_object__find_program_by_name) */
+
+/*
+ * Attach a single TC BPF program to the given hook (ingress or egress).
+ */
+static int tc_attach_one(int ifindex, enum bpf_tc_attach_point point,
+			 int prog_fd, const char *label)
+{
+	int ret;
+	LIBBPF_OPTS(bpf_tc_hook, hook,
+		    .ifindex     = ifindex,
+		    .attach_point = point);
+	LIBBPF_OPTS(bpf_tc_opts, opts,
+		    .prog_fd = prog_fd);
+
+	/* Create the clsact qdisc (may already exist -- that's OK) */
+	ret = bpf_tc_hook_create(&hook);
+	if (ret && ret != -EEXIST) {
+		warnx("failed to create TC hook for %s (err=%d)", label, ret);
+		return ret;
+	}
+
+	ret = bpf_tc_attach(&hook, &opts);
+	if (ret) {
+		warnx("failed to attach TC %s (err=%d)", label, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 int do_load(struct traffic_meter_ctl *ctl)
 {
 	const char *obj_path  = ctl->object   ? ctl->object   : DEFAULT_BPF_OBJECT;
 	const char *pin_path  = ctl->bpffs_pin ? ctl->bpffs_pin : DEFAULT_PIN_PATH;
 	struct bpf_object *obj = NULL;
-	struct bpf_program *prog = NULL;
+	struct bpf_program *prog_in, *prog_eg;
 	struct bpf_map *map;
-	int prog_fd;
 	unsigned int ifindex;
 	int ret;
 	int reuse = maps_already_pinned(pin_path);
@@ -199,9 +229,7 @@ int do_load(struct traffic_meter_ctl *ctl)
 
 	/*
 	 * 2. If maps are already pinned (from a previous load on another
-	 *    interface), tell libbpf to reuse them.  bpf_map__set_pin_path()
-	 *    before load causes libbpf to open the existing pinned fd via
-	 *    BPF_OBJ_GET instead of creating a new map.
+	 *    interface), tell libbpf to reuse them.
 	 */
 	if (reuse) {
 		bpf_object__for_each_map(map, obj) {
@@ -218,7 +246,7 @@ int do_load(struct traffic_meter_ctl *ctl)
 		}
 	}
 
-	/* 3. Load BPF program + maps into kernel */
+	/* 3. Load BPF programs + maps into kernel */
 	ret = bpf_object__load(obj);
 	if (ret) {
 		bpf_object__close(obj);
@@ -226,33 +254,45 @@ int do_load(struct traffic_meter_ctl *ctl)
 		     obj_path, ret);
 	}
 
-	/* 4. Find the XDP program (first program in the object) */
-	prog = bpf_object__next_program(obj, NULL);
-	if (!prog) {
+	/* 4. Find the ingress and egress TC programs by function name */
+	prog_in = bpf_object__find_program_by_name(obj, "traffic_meter_ingress");
+	prog_eg = bpf_object__find_program_by_name(obj, "traffic_meter_egress");
+	if (!prog_in || !prog_eg) {
 		bpf_object__close(obj);
-		errx(EXIT_FAILURE, "no BPF program found in %s", obj_path);
+		errx(EXIT_FAILURE,
+		     "BPF object must contain traffic_meter_ingress and traffic_meter_egress programs");
 	}
 
-	prog_fd = bpf_program__fd(prog);
-	if (prog_fd < 0) {
-		bpf_object__close(obj);
-		errx(EXIT_FAILURE, "invalid BPF program fd");
-	}
-
-	/* 5. Attach XDP program to network interface */
-	ret = bpf_xdp_attach(ifindex, prog_fd, 0, NULL);
+	/* 5. Attach TC programs to ingress and egress */
+	ret = tc_attach_one(ifindex, BPF_TC_INGRESS,
+			    bpf_program__fd(prog_in), "ingress");
 	if (ret) {
 		bpf_object__close(obj);
-		errx(EXIT_FAILURE, "failed to attach XDP to %s (ifindex=%u, err=%d)",
-		     ctl->dev, ifindex, ret);
+		errx(EXIT_FAILURE, "failed to attach TC ingress on %s", ctl->dev);
 	}
 
-	/* 6. Pin maps to bpffs (first load only; reuse skips this) */
+	ret = tc_attach_one(ifindex, BPF_TC_EGRESS,
+			    bpf_program__fd(prog_eg), "egress");
+	if (ret) {
+		/* Try to clean up the ingress attachment */
+		LIBBPF_OPTS(bpf_tc_hook, hook_in,
+			    .ifindex      = ifindex,
+			    .attach_point = BPF_TC_INGRESS);
+		bpf_tc_hook_destroy(&hook_in);
+		bpf_object__close(obj);
+		errx(EXIT_FAILURE, "failed to attach TC egress on %s", ctl->dev);
+	}
+
+	/* 6. Pin maps to bpffs (first load only) */
 	if (!reuse) {
 		ensure_dir(pin_path);
 		ret = bpf_object__pin_maps(obj, pin_path);
 		if (ret) {
-			bpf_xdp_detach(ifindex, 0, NULL);
+			/* Clean up TC attachments */
+			LIBBPF_OPTS(bpf_tc_hook, hook_cleanup,
+				    .ifindex      = ifindex,
+				    .attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS);
+			bpf_tc_hook_destroy(&hook_cleanup);
 			bpf_object__close(obj);
 			errx(EXIT_FAILURE, "failed to pin maps to %s (err=%d)",
 			     pin_path, ret);
@@ -260,17 +300,12 @@ int do_load(struct traffic_meter_ctl *ctl)
 	}
 
 	if (reuse)
-		printf("loaded XDP on %s (ifindex=%u), reusing maps at %s\n",
+		printf("loaded TC on %s (ifindex=%u), reusing maps at %s\n",
 		       ctl->dev, ifindex, pin_path);
 	else
-		printf("loaded XDP on %s (ifindex=%u), maps pinned at %s\n",
+		printf("loaded TC on %s (ifindex=%u), maps pinned at %s\n",
 		       ctl->dev, ifindex, pin_path);
 
-	/*
-	 * Close the bpf_object handle.  The kernel holds references to the
-	 * loaded program (via XDP attachment) and the pinned maps, so they
-	 * remain alive after we close.
-	 */
 	bpf_object__close(obj);
 	return 0;
 }
@@ -292,13 +327,21 @@ int do_unload(struct traffic_meter_ctl *ctl)
 
 	ifindex = ifindex_or_err(ctl->dev);
 
-	/* 1. Detach XDP from the interface */
-	ret = bpf_xdp_detach(ifindex, 0, NULL);
-	if (ret)
-		warnx("failed to detach XDP from %s (err=%d), continuing cleanup",
+	/*
+	 * 1. Destroy TC hooks (clsact qdisc) -- this removes both ingress
+	 *    and egress filters in one shot.  Using INGRESS|EGRESS tells
+	 *    libbpf to destroy the whole clsact qdisc.
+	 */
+	LIBBPF_OPTS(bpf_tc_hook, hook,
+		    .ifindex      = ifindex,
+		    .attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS);
+
+	ret = bpf_tc_hook_destroy(&hook);
+	if (ret && ret != -ENOENT)
+		warnx("failed to destroy TC hook on %s (err=%d), continuing cleanup",
 		      ctl->dev, ret);
 	else
-		printf("detached XDP from %s (ifindex=%u)\n",
+		printf("detached TC from %s (ifindex=%u)\n",
 		       ctl->dev, ifindex);
 
 	/* 2. Unpin maps -- remove pinned files from bpffs */
@@ -309,6 +352,8 @@ int do_unload(struct traffic_meter_ctl *ctl)
 		{ "rules_v6" },
 		{ "stats_v4" },
 		{ "stats_v6" },
+		{ "flow_table_v4" },
+		{ "flow_table_v6" },
 	};
 
 	for (size_t i = 0; i < ARRAY_SIZE(map_names); i++) {
@@ -679,55 +724,31 @@ int do_list(struct traffic_meter_ctl *ctl)
 static void sum_percpu_stats(const struct traffic_stats *percpu, int ncpus,
 			     struct traffic_stats *out)
 {
-	out->rx_packets = 0;
-	out->rx_bytes   = 0;
-	out->tx_packets = 0;
-	out->tx_bytes   = 0;
+	out->rx_bytes = 0;
+	out->tx_bytes = 0;
 	for (int i = 0; i < ncpus; i++) {
-		out->rx_packets += percpu[i].rx_packets;
-		out->rx_bytes   += percpu[i].rx_bytes;
-		out->tx_packets += percpu[i].tx_packets;
-		out->tx_bytes   += percpu[i].tx_bytes;
+		out->rx_bytes += percpu[i].rx_bytes;
+		out->tx_bytes += percpu[i].tx_bytes;
 	}
 }
 
 /*
- * Human-readable byte formatting: formats a byte count to a short
- * string with unit suffix (B, KiB, MiB, GiB, TiB).
+ * Print the table header for stats output.
  */
-static const char *fmt_bytes(__u64 bytes, char *buf, size_t len)
+static void print_stats_header(void)
 {
-	static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
-	double val = (double)bytes;
-	int u = 0;
-
-	while (val >= 1024.0 && u < 4) {
-		val /= 1024.0;
-		u++;
-	}
-
-	if (u == 0)
-		snprintf(buf, len, "%llu B", (unsigned long long)bytes);
-	else
-		snprintf(buf, len, "%.2f %s", val, units[u]);
-
-	return buf;
+	printf("  \033[1m%-40s %-20s %s\033[0m\n", "IP/CIDR", "UPSTREAM-BYTES", "DOWNSTREAM-BYTES");
 }
 
 /*
- * Print one stats line with rx/tx breakdown.
+ * Print one stats line: IP, rx bytes, tx bytes.
  */
 static void print_stats_line(const char *addr_str,
 			     const struct traffic_stats *agg)
 {
-	char rx_buf[32], tx_buf[32];
-	printf("  %-40s\n"
-	       "      rx: %llu pkts, %s    tx: %llu pkts, %s\n",
-	       addr_str,
-	       (unsigned long long)agg->rx_packets,
-	       fmt_bytes(agg->rx_bytes, rx_buf, sizeof(rx_buf)),
-	       (unsigned long long)agg->tx_packets,
-	       fmt_bytes(agg->tx_bytes, tx_buf, sizeof(tx_buf)));
+	printf("  %-40s %-20llu %llu\n", addr_str,
+	       (unsigned long long)agg->rx_bytes,
+	       (unsigned long long)agg->tx_bytes);
 }
 
 /*
@@ -850,7 +871,7 @@ static int lookup_stats_v6(int fd, int ncpus,
 	return 1;
 }
 
-int do_stats(struct traffic_meter_ctl *ctl)
+int do_show(struct traffic_meter_ctl *ctl)
 {
 	const char *pin_path = ctl->bpffs_pin ? ctl->bpffs_pin : DEFAULT_PIN_PATH;
 	struct lpm_v4_key flt_v4 = {};
@@ -875,18 +896,15 @@ int do_stats(struct traffic_meter_ctl *ctl)
 	fd_v4 = open_pinned_map(pin_path, "stats_v4");
 	fd_v6 = open_pinned_map(pin_path, "stats_v6");
 
+	print_stats_header();
+
 	if (filter_af == ADDR_V4) {
-		/* Exact lookup for a single IPv4 rule */
 		total += lookup_stats_v4(fd_v4, ncpus, &flt_v4);
 	} else if (filter_af == ADDR_V6) {
-		/* Exact lookup for a single IPv6 rule */
 		total += lookup_stats_v6(fd_v6, ncpus, &flt_v6);
 	} else {
-		/* Show all */
-		printf("IPv4 stats:\n");
+		/* Show all: IPv4 first, then IPv6 */
 		total += dump_stats_v4(fd_v4, ncpus);
-
-		printf("IPv6 stats:\n");
 		total += dump_stats_v6(fd_v6, ncpus);
 	}
 
