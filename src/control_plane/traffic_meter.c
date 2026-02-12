@@ -99,10 +99,11 @@ static void __attribute__((__noreturn__)) usage_cmd(const char *cmd)
 		fprintf(out, " %s list\n",
 			program_invocation_short_name);
 	} else if (strcmp(cmd, "show") == 0) {
-		fprintf(out, " %s show [--ip-address <IP or CIDR>]\n",
+		fprintf(out, " %s show [-H] [--ip-address <IP or CIDR>]\n",
 			program_invocation_short_name);
 		fputs(USAGE_OPTIONS, out);
 		fputs(" -a, --ip-address <addr> show statistics for specific rule only\n", out);
+		fputs(" -H, --human-readable    show bytes in human-readable format (KiB, MiB, GiB)\n", out);
 	}
 
 	fputs(USAGE_SEPARATOR, out);
@@ -139,16 +140,17 @@ int main(int argc, char **argv)
 	int c;
 
 	static const struct option longopts[] = {
-		{ "dev",        required_argument, NULL, 'd' },
-		{ "object",     required_argument, NULL, 'o' },
-		{ "bpffs-pin",  required_argument, NULL, 'p' },
-		{ "ip-address", required_argument, NULL, 'a' },
-		{ "file",       required_argument, NULL, 'f' },
-		{ "version",    no_argument,       NULL, 'V' },
-		{ "help",       no_argument,       NULL, 'h' },
+		{ "dev",            required_argument, NULL, 'd' },
+		{ "object",         required_argument, NULL, 'o' },
+		{ "bpffs-pin",      required_argument, NULL, 'p' },
+		{ "ip-address",     required_argument, NULL, 'a' },
+		{ "file",           required_argument, NULL, 'f' },
+		{ "human-readable", no_argument,       NULL, 'H' },
+		{ "version",        no_argument,       NULL, 'V' },
+		{ "help",           no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	static const char *shortopts = "+d:o:p:a:f:Vh";
+	static const char *shortopts = "+d:o:p:a:f:HVh";
 
 	/*
 	 * First non-option argument is the subcommand.
@@ -194,6 +196,9 @@ int main(int argc, char **argv)
 			break;
 		case 'f':
 			ctl.file = optarg;
+			break;
+		case 'H':
+			ctl.human = 1;
 			break;
 		case 'V':
 			print_version(EXIT_SUCCESS);

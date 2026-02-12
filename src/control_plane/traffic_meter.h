@@ -34,6 +34,9 @@ struct traffic_meter_ctl {
 
 	/* import */
 	const char	*file;		/* --file <path.json> */
+
+	/* show */
+	int		human;		/* -h: human-readable output */
 };
 
 /*

@@ -733,22 +733,58 @@ static void sum_percpu_stats(const struct traffic_stats *percpu, int ncpus,
 }
 
 /*
+ * Human-readable byte formatting: formats a byte count to a short
+ * string with unit suffix (B, KiB, MiB, GiB, TiB).
+ */
+static const char *fmt_bytes(__u64 bytes, char *buf, size_t len)
+{
+	static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+	double val = (double)bytes;
+	int u = 0;
+
+	while (val >= 1024.0 && u < 4) {
+		val /= 1024.0;
+		u++;
+	}
+
+	if (u == 0)
+		snprintf(buf, len, "%llu B", (unsigned long long)bytes);
+	else
+		snprintf(buf, len, "%.2f %s", val, units[u]);
+
+	return buf;
+}
+
+/* Whether to use human-readable output (set by -H flag) */
+static int human_readable;
+
+/*
  * Print the table header for stats output.
  */
 static void print_stats_header(void)
 {
-	printf("  \033[1m%-40s %-20s %s\033[0m\n", "IP/CIDR", "UPSTREAM-BYTES", "DOWNSTREAM-BYTES");
+	if (human_readable)
+		printf("  \033[1m%-40s %-20s %s\033[0m\n", "IP/CIDR", "UPSTREAM", "DOWNSTREAM");
+	else
+		printf("  \033[1m%-40s %-20s %s\033[0m\n", "IP/CIDR", "UPSTREAM-BYTES", "DOWNSTREAM-BYTES");
 }
 
 /*
- * Print one stats line: IP, rx bytes, tx bytes.
+ * Print one stats line: IP, upstream bytes, downstream bytes.
  */
 static void print_stats_line(const char *addr_str,
 			     const struct traffic_stats *agg)
 {
-	printf("  %-40s %-20llu %llu\n", addr_str,
-	       (unsigned long long)agg->rx_bytes,
-	       (unsigned long long)agg->tx_bytes);
+	if (human_readable) {
+		char up_buf[32], down_buf[32];
+		fmt_bytes(agg->rx_bytes, up_buf, sizeof(up_buf));
+		fmt_bytes(agg->tx_bytes, down_buf, sizeof(down_buf));
+		printf("  %-40s %-20s %s\n", addr_str, up_buf, down_buf);
+	} else {
+		printf("  %-40s %-20llu %llu\n", addr_str,
+		       (unsigned long long)agg->rx_bytes,
+		       (unsigned long long)agg->tx_bytes);
+	}
 }
 
 /*
@@ -879,6 +915,8 @@ int do_show(struct traffic_meter_ctl *ctl)
 	int fd_v4, fd_v6, ncpus;
 	int total = 0;
 	int filter_af = 0; /* 0 = show all */
+
+	human_readable = ctl->human;
 
 	ncpus = libbpf_num_possible_cpus();
 	if (ncpus < 0)
